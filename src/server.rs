@@ -376,8 +376,8 @@ impl<C> SccacheService<C>
             compilers: Rc::new(RefCell::new(HashMap::new())),
             force_recache: env::var("SCCACHE_RECACHE").is_ok(),
             pool: pool,
+            creator: C::new(&handle),
             handle: handle,
-            creator: C::new(),
             tx: tx,
             info: info,
         }
@@ -433,18 +433,13 @@ impl<C> SccacheService<C>
             None => {
                 trace!("compiler_info cache miss");
                 // Run a Task to check the compiler type.
-                let exe2 = exe.clone();
-                let me = self.clone();
-                let creator = me.creator.clone();
-
-                let info = self.pool.spawn_fn(move || {
-                    Ok(get_compiler_info(creator, &exe2))
-                });
+                let info = get_compiler_info(&self.creator, &exe, &self.pool);
 
                 let me = self.clone();
-                Box::new(info.map(move |info| {
+                Box::new(info.then(move |info| {
+                    let info = info.ok();
                     me.cache_compiler_info(exe, &info);
-                    me.check_compiler(info, cmd, cwd)
+                    Ok(me.check_compiler(info, cmd, cwd))
                 }))
             }
         }
