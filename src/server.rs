@@ -144,7 +144,7 @@ impl<C: CommandCreatorSync> SccacheServer<C> {
         // connections.
         let (tx, rx) = mpsc::channel(1);
         let pool = CpuPool::new(20);
-        let storage = storage_from_environment(&pool);
+        let storage = storage_from_environment(&pool, &handle);
         let (wait, info) = WaitUntilZero::new();
         let service = SccacheService::new(storage, core.handle(), pool, tx, info);
 

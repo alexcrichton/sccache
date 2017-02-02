@@ -185,11 +185,8 @@ pub struct CacheWriteInfo {
     pub duration: Duration,
 }
 
-/// Result of writing to cache storage.
-pub type CacheWriteResult = result::Result<CacheWriteInfo, String>;
-
 /// A `Future` that may provide a `CacheWriteResult`.
-pub type CacheWriteFuture = Box<Future<Item=CacheWriteInfo, Error=String> + Send>;
+pub type CacheWriteFuture = Box<Future<Item=CacheWriteInfo, Error=String>>;
 
 /// The result of a compilation or cache retrieval.
 pub enum CompileResult {
@@ -446,17 +443,17 @@ impl Compiler {
                     // Not cacheable
                     debug!("[{}]: Compiled but not cacheable",
                            parsed_args.output_file());
-                    return future::ok((CompileResult::NotCacheable, compiler_result)).boxed()
+                    return Box::new(future::ok((CompileResult::NotCacheable, compiler_result)))
                         as Box<Future<Item=_, Error=_>>
                 }
             } else {
                 debug!("[{}]: Compiled but failed, not storing in cache",
                        parsed_args.output_file());
-                return future::ok((CompileResult::CompileFailed, compiler_result)).boxed()
+                return Box::new(future::ok((CompileResult::CompileFailed, compiler_result)))
             }
             let mut entry = match storage.start_put(&key) {
                 Ok(entry) => entry,
-                Err(e) => return future::err(e).boxed()
+                Err(e) => return Box::new(future::err(e))
             };
             let write = pool.spawn_fn(move || -> io::Result<_> {
                 for (key, path) in &outputs {
