@@ -104,7 +104,7 @@ impl CompilerKind {
     pub fn compile<T>(&self,
                       creator: &T,
                       compiler: &Compiler,
-                      preprocessor_output: Vec<u8>,
+                      preprocessor_result: process::Output,
                       parsed_args: &ParsedArguments,
                       cwd: &str,
                       pool: &CpuPool)
@@ -112,9 +112,9 @@ impl CompilerKind {
         where T: CommandCreatorSync,
     {
         match *self {
-            CompilerKind::Gcc => gcc::compile(creator, compiler, preprocessor_output, parsed_args, cwd, pool),
-            CompilerKind::Clang => clang::compile(creator, compiler, preprocessor_output, parsed_args, cwd, pool),
-            CompilerKind::Msvc { .. } => msvc::compile(creator, compiler, preprocessor_output, parsed_args, cwd, pool),
+            CompilerKind::Gcc => gcc::compile(creator, compiler, preprocessor_result, parsed_args, cwd, pool),
+            CompilerKind::Clang => clang::compile(creator, compiler, preprocessor_result, parsed_args, cwd, pool),
+            CompilerKind::Msvc { .. } => msvc::compile(creator, compiler, preprocessor_result, parsed_args, cwd, pool),
         }
     }
 }
@@ -135,6 +135,8 @@ pub struct ParsedArguments {
     pub preprocessor_args: Vec<String>,
     /// Commandline arguments for the preprocessor or the compiler.
     pub common_args: Vec<String>,
+    /// Whether, for MSVC, the `-showIncludes` flag is passed.
+    pub msvc_show_includes: bool,
 }
 
 impl ParsedArguments {
@@ -421,11 +423,15 @@ impl Compiler {
                   -> SFuture<(CompileResult, process::Output)>
         where T: CommandCreatorSync,
     {
-        let process::Output { stdout, .. } = preprocessor_result;
         let start = Instant::now();
         let out_file = parsed_args.output_file().into_owned();
 
-        let compile = self.kind.compile(creator, self, stdout, &parsed_args, cwd, &pool);
+        let compile = self.kind.compile(creator,
+                                        self,
+                                        preprocessor_result,
+                                        &parsed_args,
+                                        cwd,
+                                        &pool);
         Box::new(compile.and_then(move |(cacheable, compiler_result)| {
             let duration = start.elapsed();
             if !compiler_result.status.success() {
