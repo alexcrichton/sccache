@@ -50,7 +50,7 @@ pub fn argument_takes_value(arg: &str) -> bool {
 
 pub fn compile<T>(creator: &T,
                   compiler: &Compiler,
-                  preprocessor_output: Vec<u8>,
+                  preprocessor_result: process::Output,
                   parsed_args: &ParsedArguments,
                   cwd: &str,
                   pool: &CpuPool)
@@ -65,7 +65,7 @@ pub fn compile<T>(creator: &T,
             Some(name) => name,
             None => return future::err("missing input filename".into()).boxed(),
         };
-        write_temp_file(pool, filename.as_ref(), preprocessor_output)
+        write_temp_file(pool, filename.as_ref(), preprocessor_result.stdout)
     };
     let input = parsed_args.input.clone();
     let out_file = match parsed_args.outputs.get("obj") {
@@ -133,36 +133,53 @@ mod test {
 
     #[test]
     fn test_parse_arguments_simple() {
-        match _parse_arguments(&stringvec!["-c", "foo.c", "-o", "foo.o"]) {
-            CompilerArguments::Ok(ParsedArguments { input, extension, depfile: _depfile, outputs, preprocessor_args, common_args }) => {
-                assert!(true, "Parsed ok");
-                assert_eq!("foo.c", input);
-                assert_eq!("c", extension);
-                assert_map_contains!(outputs, ("obj", "foo.o"));
-                //TODO: fix assert_map_contains to assert no extra keys!
-                assert_eq!(1, outputs.len());
-                assert!(preprocessor_args.is_empty());
-                assert!(common_args.is_empty());
-            }
-            o @ _ => assert!(false, format!("Got unexpected parse result: {:?}", o)),
-        }
+        let args = stringvec!["-c", "foo.c", "-o", "foo.o"];
+        let ParsedArguments {
+            input,
+            extension,
+            depfile: _,
+            outputs,
+            preprocessor_args,
+            msvc_show_includes,
+            common_args,
+        } = match _parse_arguments(&args) {
+            CompilerArguments::Ok(args) => args,
+            o @ _ => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(true, "Parsed ok");
+        assert_eq!("foo.c", input);
+        assert_eq!("c", extension);
+        assert_map_contains!(outputs, ("obj", "foo.o"));
+        //TODO: fix assert_map_contains to assert no extra keys!
+        assert_eq!(1, outputs.len());
+        assert!(preprocessor_args.is_empty());
+        assert!(common_args.is_empty());
+        assert!(!msvc_show_includes);
     }
 
     #[test]
     fn test_parse_arguments_values() {
-        match _parse_arguments(&stringvec!["-c", "foo.cxx", "-arch", "xyz", "-fabc","-I", "include", "-o", "foo.o", "-include", "file"]) {
-            CompilerArguments::Ok(ParsedArguments { input, extension, depfile: _depfile, outputs, preprocessor_args, common_args }) => {
-                assert!(true, "Parsed ok");
-                assert_eq!("foo.cxx", input);
-                assert_eq!("cxx", extension);
-                assert_map_contains!(outputs, ("obj", "foo.o"));
-                //TODO: fix assert_map_contains to assert no extra keys!
-                assert_eq!(1, outputs.len());
-                assert!(preprocessor_args.is_empty());
-                assert_eq!(stringvec!["-arch", "xyz", "-fabc", "-I", "include", "-include", "file"], common_args);
-            }
-            o @ _ => assert!(false, format!("Got unexpected parse result: {:?}", o)),
-        }
+        let args = stringvec!["-c", "foo.cxx", "-arch", "xyz", "-fabc", "-I", "include", "-o", "foo.o", "-include", "file"];
+        let ParsedArguments {
+            input,
+            extension,
+            depfile: _,
+            outputs,
+            preprocessor_args,
+            msvc_show_includes,
+            common_args,
+        } = match _parse_arguments(&args) {
+            CompilerArguments::Ok(args) => args,
+            o @ _ => panic!("Got unexpected parse result: {:?}", o),
+        };
+        assert!(true, "Parsed ok");
+        assert_eq!("foo.cxx", input);
+        assert_eq!("cxx", extension);
+        assert_map_contains!(outputs, ("obj", "foo.o"));
+        //TODO: fix assert_map_contains to assert no extra keys!
+        assert_eq!(1, outputs.len());
+        assert!(preprocessor_args.is_empty());
+        assert_eq!(stringvec!["-arch", "xyz", "-fabc", "-I", "include", "-include", "file"], common_args);
     }
 
     #[test]
@@ -177,6 +194,7 @@ mod test {
             outputs: vec![("obj", "foo.o".to_owned())].into_iter().collect::<HashMap<&'static str, String>>(),
             preprocessor_args: vec!(),
             common_args: vec!(),
+            msvc_show_includes: false,
         };
         let compiler = Compiler::new(f.bins[0].to_str().unwrap(),
                                      CompilerKind::Clang).unwrap();
@@ -184,7 +202,7 @@ mod test {
         next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
         let (cacheable, _) = compile(&creator,
                                      &compiler,
-                                     vec!(),
+                                     empty_output(),
                                      &parsed_args,
                                      f.tempdir.path().to_str().unwrap(),
                                      &pool).wait().unwrap();
@@ -205,6 +223,7 @@ mod test {
             outputs: vec![("obj", "foo.o".to_owned())].into_iter().collect::<HashMap<&'static str, String>>(),
             preprocessor_args: vec!(),
             common_args: stringvec!("-c", "-o", "foo.o", "-Werror=blah", "foo.c"),
+            msvc_show_includes: false,
         };
         let compiler = Compiler::new(f.bins[0].to_str().unwrap(),
                                      CompilerKind::Clang).unwrap();
@@ -214,7 +233,7 @@ mod test {
         next_command(&creator, Ok(MockChild::new(exit_status(0), "", "")));
         let (cacheable, output) = compile(&creator,
                                           &compiler,
-                                          vec!(),
+                                          empty_output(),
                                           &parsed_args,
                                           f.tempdir.path().to_str().unwrap(),
                                           &pool).wait().unwrap();
