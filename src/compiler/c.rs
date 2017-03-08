@@ -64,6 +64,8 @@ pub struct ParsedArguments {
     pub preprocessor_args: Vec<String>,
     /// Commandline arguments for the preprocessor or the compiler.
     pub common_args: Vec<String>,
+    /// Whether or not the `-showIncludes` argument is passed on MSVC
+    pub msvc_show_includes: bool,
 }
 
 impl ParsedArguments {
@@ -77,7 +79,7 @@ struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     executable: String,
     /// The output from running the preprocessor.
-    preprocessor_output: Vec<u8>,
+    preprocessor_result: process::Output,
     compiler: I,
 }
 
@@ -113,7 +115,7 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + 'static {
     fn compile<T>(&self,
                   creator: &T,
                   executable: &str,
-                  preprocessor_output: Vec<u8>,
+                  preprocessor_result: process::Output,
                   parsed_args: &ParsedArguments,
                   cwd: &str,
                   pool: &CpuPool)
@@ -209,7 +211,7 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
                 compilation: Box::new(CCompilation {
                     parsed_args: parsed_args,
                     executable: executable,
-                    preprocessor_output: preprocessor_result.stdout,
+                    preprocessor_result: preprocessor_result,
                     compiler: compiler,
                 }),
             }
@@ -235,8 +237,8 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
                -> SFuture<(Cacheable, process::Output)>
     {
         let me = *self;
-        let CCompilation { parsed_args, executable, preprocessor_output, compiler } = me;
-        compiler.compile(creator, &executable, preprocessor_output, &parsed_args, cwd, pool)
+        let CCompilation { parsed_args, executable, preprocessor_result, compiler } = me;
+        compiler.compile(creator, &executable, preprocessor_result, &parsed_args, cwd, pool)
     }
 
     fn outputs<'a>(&'a self) -> Box<Iterator<Item=(&'a str, &'a String)> + 'a>
