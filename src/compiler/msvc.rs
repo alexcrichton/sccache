@@ -153,53 +153,48 @@ pub fn parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArgument
 
     //TODO: support arguments that start with / as well.
     let mut it = arguments.iter();
-    loop {
-        match it.next() {
-            Some(arg) => {
-                match arg.as_ref() {
-                    "-c" => compilation = true,
-                    v if v.starts_with("-Fo") => {
-                        output_arg = Some(String::from(&v[3..]));
-                    }
-                    // Arguments that take a value.
-                    "-FI" => {
-                        common_args.push(arg.clone());
-                        if let Some(arg_val) = it.next() {
-                            common_args.push(arg_val.clone());
-                        }
-                    }
-                    v @ _ if v.starts_with("-deps") => {
-                        depfile = Some(v[5..].to_owned());
-                    }
-                    // Arguments we can't handle.
-                    "-showIncludes" => return CompilerArguments::CannotCache,
-                    a if a.starts_with('@') => return CompilerArguments::CannotCache,
-                    // Arguments we can't handle because they output more files.
-                    // TODO: support more multi-file outputs.
-                    "-FA" | "-Fa" | "-Fe" | "-Fm" | "-Fp" | "-FR" | "-Fx" => return CompilerArguments::CannotCache,
-                    "-Zi" => {
-                        debug_info = true;
-                        common_args.push(arg.clone());
-                    }
-                    v if v.starts_with("-Fd") => {
-                        pdb = Some(String::from(&v[3..]));
-                        common_args.push(arg.clone());
-                    }
-                    // Other options.
-                    v if v.starts_with('-') && v.len() > 1 => {
-                        common_args.push(arg.clone());
-                    }
-                    // Anything else is an input file.
-                    v => {
-                        if input_arg.is_some() {
-                            // Can't cache compilations with multiple inputs.
-                            return CompilerArguments::CannotCache;
-                        }
-                        input_arg = Some(v);
-                    }
+    while let Some(arg) = it.next() {
+        match arg.as_ref() {
+            "-c" => compilation = true,
+            v if v.starts_with("-Fo") => {
+                output_arg = Some(String::from(&v[3..]));
+            }
+            // Arguments that take a value.
+            "-FI" => {
+                common_args.push(arg.clone());
+                if let Some(arg_val) = it.next() {
+                    common_args.push(arg_val.clone());
                 }
             }
-            None => break,
+            v @ _ if v.starts_with("-deps") => {
+                depfile = Some(v[5..].to_owned());
+            }
+            // Arguments we can't handle.
+            "-showIncludes" => return CompilerArguments::CannotCache,
+            a if a.starts_with('@') => return CompilerArguments::CannotCache,
+            // Arguments we can't handle because they output more files.
+            // TODO: support more multi-file outputs.
+            "-FA" | "-Fa" | "-Fe" | "-Fm" | "-Fp" | "-FR" | "-Fx" => return CompilerArguments::CannotCache,
+            "-Zi" => {
+                debug_info = true;
+                common_args.push(arg.clone());
+            }
+            v if v.starts_with("-Fd") => {
+                pdb = Some(String::from(&v[3..]));
+                common_args.push(arg.clone());
+            }
+            // Other options.
+            v if v.starts_with('-') && v.len() > 1 => {
+                common_args.push(arg.clone());
+            }
+            // Anything else is an input file.
+            v => {
+                if input_arg.is_some() {
+                    // Can't cache compilations with multiple inputs.
+                    return CompilerArguments::CannotCache;
+                }
+                input_arg = Some(v);
+            }
         }
     }
     // We only support compilation.
