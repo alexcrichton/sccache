@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use bytes::BytesMut;
 use cache::{
     Storage,
     storage_from_environment,
@@ -66,8 +67,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_core::reactor::{Handle, Core, Timeout};
-use tokio_core::io::{Codec, EasyBuf, Io, Framed};
 use tokio_core::net::TcpListener;
+use tokio_io::{AsyncRead, AsyncWrite};
+use tokio_io::codec::{Encoder, Decoder, Framed};
 use tokio_proto::BindServer;
 use tokio_proto::streaming::pipeline::{Frame, ServerProto, Transport};
 use tokio_proto::streaming::{Body, Message};
@@ -725,7 +727,7 @@ impl ServerStats {
 struct SccacheProto;
 
 impl<I> ServerProto<I> for SccacheProto
-    where I: Io + 'static,
+    where I: AsyncRead + AsyncWrite + 'static,
 {
     type Request = ClientRequest;
     type RequestBody = ();
@@ -737,7 +739,7 @@ impl<I> ServerProto<I> for SccacheProto
 
     fn bind_transport(&self, io: I) -> Self::BindTransport {
         future::ok(SccacheTransport {
-            inner: io.framed(ProtobufCodec::new()),
+            inner: AsyncRead::framed(io, ProtobufCodec::new()),
         })
     }
 }
@@ -750,7 +752,7 @@ struct SccacheTransport<I> {
     inner: Framed<I, ProtobufCodec<ClientRequest, ServerResponse>>,
 }
 
-impl<I: Io> Stream for SccacheTransport<I> {
+impl<I: AsyncRead + AsyncWrite> Stream for SccacheTransport<I> {
     type Item = Frame<ClientRequest, (), Error>;
     type Error = io::Error;
 
@@ -765,7 +767,7 @@ impl<I: Io> Stream for SccacheTransport<I> {
     }
 }
 
-impl<I: Io> Sink for SccacheTransport<I> {
+impl<I: AsyncRead + AsyncWrite> Sink for SccacheTransport<I> {
     type SinkItem = Frame<ServerResponse, ServerResponse, Error>;
     type SinkError = io::Error;
 
@@ -807,9 +809,13 @@ impl<I: Io> Sink for SccacheTransport<I> {
     fn poll_complete(&mut self) -> Poll<(), io::Error> {
         self.inner.poll_complete()
     }
+
+    fn close(&mut self) -> Poll<(), io::Error> {
+        self.inner.close()
+    }
 }
 
-impl<I: Io + 'static> Transport for SccacheTransport<I> {}
+impl<I: AsyncRead + AsyncWrite + 'static> Transport for SccacheTransport<I> {}
 
 /// Simple tokio-core `Codec` which uses stock protobuf functions to
 /// decode/encode protobuf messages.
@@ -826,21 +832,37 @@ impl<Request, Response> ProtobufCodec<Request, Response>
     }
 }
 
-impl<Request, Response> Codec for ProtobufCodec<Request, Response>
+impl<Request, Response> Encoder for ProtobufCodec<Request, Response>
     where Request: protobuf::Message + protobuf::MessageStatic,
           Response: protobuf::Message,
 {
-    type In = Request;
-    type Out = Response;
+    type Item = Response;
+    type Error = io::Error;
 
-    fn decode(&mut self, buf: &mut EasyBuf) -> io::Result<Option<Request>> {
-        if buf.as_slice().len() == 0 {
+    fn encode(&mut self, msg: Response, buf: &mut BytesMut) -> io::Result<()> {
+        let bytes = msg.write_length_delimited_to_bytes().map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, e)
+        })?;
+        buf.extend(&bytes);
+        Ok(())
+    }
+}
+
+impl<Request, Response> Decoder for ProtobufCodec<Request, Response>
+    where Request: protobuf::Message + protobuf::MessageStatic,
+          Response: protobuf::Message,
+{
+    type Item = Request;
+    type Error = io::Error;
+
+    fn decode(&mut self, buf: &mut BytesMut) -> io::Result<Option<Request>> {
+        if buf.len() == 0 {
             return Ok(None)
         }
-        match parse_length_delimited_from_bytes::<Request>(buf.as_slice()) {
+        match parse_length_delimited_from_bytes::<Request>(&buf) {
             Ok(req) => {
                 let size = req.write_length_delimited_to_bytes().unwrap().len();
-                buf.drain_to(size);
+                buf.split_to(size);
                 Ok(Some(req))
             }
             // Unexpected EOF is OK, just means we haven't read enough
@@ -859,14 +881,6 @@ impl<Request, Response> Codec for ProtobufCodec<Request, Response>
                 Err(io::Error::new(io::ErrorKind::Other, message))
             }
         }
-    }
-
-    fn encode(&mut self, msg: Response, buf: &mut Vec<u8>) -> io::Result<()> {
-        let bytes = msg.write_length_delimited_to_bytes().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, e)
-        })?;
-        buf.extend_from_slice(&bytes);
-        Ok(())
     }
 }
 
