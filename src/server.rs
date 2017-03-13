@@ -550,7 +550,8 @@ impl<C> SccacheService<C>
                                                     &parsed_arguments,
                                                     &cwd,
                                                     cache_control,
-                                                    &self.pool);
+                                                    &self.pool,
+                                                    &self.handle);
         let me = self.clone();
         let task = result.then(move |result| {
             let mut res = ServerResponse::new();
@@ -575,6 +576,9 @@ impl<C> SccacheService<C>
                                 MissType::ForcedRecache => {
                                     stats.cache_misses += 1;
                                     stats.forced_recaches += 1;
+                                }
+                                MissType::TimedOut => {
+                                    stats.cache_misses += 1;
                                 }
                             }
                             stats.cache_read_miss_duration += duration;

@@ -53,6 +53,7 @@ use std::time::{
     Instant,
 };
 use tempdir::TempDir;
+use tokio_core::reactor::{Handle, Timeout};
 
 use errors::*;
 
@@ -176,6 +177,8 @@ pub enum MissType {
     Normal,
     /// Cache lookup was overridden, recompilation was forced.
     ForcedRecache,
+    /// Cache took too long to respond.
+    TimedOut,
 }
 
 /// Information about a successful cache write.
@@ -300,7 +303,8 @@ impl Compiler {
                                     parsed_args: &ParsedArguments,
                                     cwd: &str,
                                     cache_control: CacheControl,
-                                    pool: &CpuPool)
+                                    pool: &CpuPool,
+                                    handle: &Handle)
                                     -> SFuture<(CompileResult, process::Output)>
         where T: CommandCreatorSync
     {
@@ -321,6 +325,7 @@ impl Compiler {
         let storage = storage.clone();
         let pool = pool.clone();
         let creator = creator.clone();
+        let handle = handle.clone();
 
         Box::new(result.and_then(move |preprocessor_result| -> SFuture<_> {
             // If the preprocessor failed, just return that result.
@@ -357,6 +362,20 @@ impl Compiler {
                 storage.get(&key)
             };
 
+            // Wait at most a minute for the cache to respond before we forge
+            // ahead ourselves with a compilation.
+            let timeout = Duration::new(60, 0);
+            let timeout = Timeout::new(timeout, &handle).into_future().flatten();
+
+            let cache_status = cache_status.map(Some);
+            let timeout = timeout.map(|_| None).chain_err(|| "timeout error");
+            let cache_status = cache_status.select(timeout).then(|r| {
+                match r {
+                    Ok((a, _other)) => Ok(a),
+                    Err((e, _other)) => Err(e),
+                }
+            });
+
             Box::new(cache_status.and_then(move |result| {
                 let duration = start.elapsed();
                 let pwd = Path::new(&cwd);
@@ -365,7 +384,7 @@ impl Compiler {
                     .collect::<HashMap<_, _>>();
 
                 let miss_type = match result {
-                    Cache::Hit(mut entry) => {
+                    Some(Cache::Hit(mut entry)) => {
                         debug!("[{}]: Cache hit!", parsed_args.output_file());
                         let mut stdout = io::Cursor::new(vec!());
                         let mut stderr = io::Cursor::new(vec!());
@@ -388,13 +407,17 @@ impl Compiler {
                             (result, output)
                         })) as SFuture<_>
                     }
-                    Cache::Miss => {
+                    Some(Cache::Miss) => {
                         debug!("[{}]: Cache miss!", parsed_args.output_file());
                         MissType::Normal
                     }
-                    Cache::Recache => {
+                    Some(Cache::Recache) => {
                         debug!("[{}]: Cache recache!", parsed_args.output_file());
                         MissType::ForcedRecache
+                    }
+                    None => {
+                        debug!("[{}]: Cache timed out!", parsed_args.output_file());
+                        MissType::TimedOut
                     }
                 };
                 me.compile(&creator,
@@ -668,6 +691,7 @@ mod test {
     use std::time::Duration;
     use std::usize;
     use test::utils::*;
+    use tokio_core::reactor::Core;
 
     #[test]
     fn test_detect_compiler_kind_gcc() {
@@ -748,6 +772,8 @@ mod test {
         let creator = new_creator();
         let f = TestFixture::new();
         let pool = CpuPool::new(1);
+        let core = Core::new().unwrap();
+        let handle = core.handle();
         let storage = DiskCache::new(&f.tempdir.path().join("cache"),
                                      usize::MAX,
                                      &pool);
@@ -784,7 +810,8 @@ mod test {
                                                     &parsed_args,
                                                     cwd,
                                                     CacheControl::Default,
-                                                    &pool).wait().unwrap();
+                                                    &pool,
+                                                    &handle).wait().unwrap();
         // Ensure that the object file was created.
         assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
         match cached {
@@ -808,7 +835,8 @@ mod test {
                                                     &parsed_args,
                                                     cwd,
                                                     CacheControl::Default,
-                                                    &pool).wait().unwrap();
+                                                    &pool,
+                                                    &handle).wait().unwrap();
         // Ensure that the object file was created.
         assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
         assert_eq!(CompileResult::CacheHit(Duration::new(0, 0)), cached);
@@ -824,6 +852,8 @@ mod test {
         let creator = new_creator();
         let f = TestFixture::new();
         let pool = CpuPool::new(1);
+        let core = Core::new().unwrap();
+        let handle = core.handle();
         let storage = DiskCache::new(&f.tempdir.path().join("cache"),
                                      usize::MAX,
                                      &pool);
@@ -860,7 +890,8 @@ mod test {
                                                     &parsed_args,
                                                     cwd,
                                                     CacheControl::Default,
-                                                    &pool).wait().unwrap();
+                                                    &pool,
+                                                    &handle).wait().unwrap();
         // Ensure that the object file was created.
         assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
         match cached {
@@ -885,7 +916,8 @@ mod test {
                                                     &parsed_args,
                                                     cwd,
                                                     CacheControl::Default,
-                                                    &pool).wait().unwrap();
+                                                    &pool,
+                                                    &handle).wait().unwrap();
         // Ensure that the object file was created.
         assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
         assert_eq!(CompileResult::CacheHit(Duration::new(0, 0)), cached);
@@ -901,6 +933,8 @@ mod test {
         let creator = new_creator();
         let f = TestFixture::new();
         let pool = CpuPool::new(1);
+        let core = Core::new().unwrap();
+        let handle = core.handle();
         let storage = DiskCache::new(&f.tempdir.path().join("cache"),
                                      usize::MAX,
                                      &pool);
@@ -941,7 +975,8 @@ mod test {
                                                     &parsed_args,
                                                     cwd,
                                                     CacheControl::Default,
-                                                    &pool).wait().unwrap();
+                                                    &pool,
+                                                    &handle).wait().unwrap();
         // Ensure that the object file was created.
         assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
         match cached {
@@ -962,7 +997,8 @@ mod test {
                                                     &parsed_args,
                                                     cwd,
                                                     CacheControl::ForceRecache,
-                                                    &pool).wait().unwrap();
+                                                    &pool,
+                                                    &handle).wait().unwrap();
         // Ensure that the object file was created.
         assert_eq!(true, fs::metadata(&obj).and_then(|m| Ok(m.len() > 0)).unwrap());
         match cached {
@@ -984,6 +1020,8 @@ mod test {
         let creator = new_creator();
         let f = TestFixture::new();
         let pool = CpuPool::new(1);
+        let core = Core::new().unwrap();
+        let handle = core.handle();
         let storage = DiskCache::new(&f.tempdir.path().join("cache"),
                                      usize::MAX,
                                      &pool);
@@ -1008,7 +1046,8 @@ mod test {
                                                     &parsed_args,
                                                     cwd,
                                                     CacheControl::Default,
-                                                    &pool).wait().unwrap();
+                                                    &pool,
+                                                    &handle).wait().unwrap();
         assert_eq!(cached, CompileResult::Error);
         assert_eq!(exit_status(1), res.status);
         // Shouldn't get anything on stdout, since that would just be preprocessor spew!
