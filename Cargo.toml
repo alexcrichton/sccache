@@ -56,6 +56,6 @@ default = []
 unstable = []
 
 [profile.release]
-debug = true
+#debug = true
 
 [workspace]
