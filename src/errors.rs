@@ -18,12 +18,14 @@ use std::io;
 use futures::Future;
 use hyper;
 use lru_disk_cache;
+use serde_json;
 
 error_chain! {
     foreign_links {
         Io(io::Error);
         Hyper(hyper::Error);
         Lru(lru_disk_cache::Error);
+        Json(serde_json::Error);
     }
 
     errors {

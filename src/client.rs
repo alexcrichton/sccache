@@ -12,18 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use protobuf::{
-    CodedInputStream,
-    Message,
-    ProtobufError,
-    ProtobufResult,
-    parse_from_bytes,
-};
-use protocol::{
-    ClientRequest,
-    ServerResponse,
-};
+use byteorder::{ByteOrder, BigEndian};
+use protocol::{Request, Response};
 use retry::retry;
+use serde_json;
+use errors::*;
 use std::io::{
     self,
     BufReader,
@@ -52,28 +45,29 @@ impl ServerConnection {
     }
 
     /// Send `request` to the server, read and return a `ServerResponse`.
-    pub fn request(&mut self, request : ClientRequest)
-                   -> ProtobufResult<ServerResponse> {
+    pub fn request(&mut self, request: Request) -> Result<Response> {
         trace!("ServerConnection::request");
-        try!(request.write_length_delimited_to_writer(&mut self.writer));
-        try!(self.writer.flush().or_else(|e| Err(ProtobufError::IoError(e))));
+        let json = serde_json::to_string(&request)?;
+        let mut bytes = [0; 4];
+        BigEndian::write_u32(&mut bytes, json.len() as u32);
+        self.writer.write_all(&bytes)?;
+        self.writer.write_all(json.as_bytes())?;
+        self.writer.flush()?;
         trace!("ServerConnection::request: sent request");
         self.read_one_response()
     }
 
     /// Read a single `ServerResponse` from the server.
-    pub fn read_one_response(&mut self) -> ProtobufResult<ServerResponse> {
+    pub fn read_one_response(&mut self) -> Result<Response> {
         trace!("ServerConnection::read_one_response");
-        //FIXME: wish `parse_length_delimited_from` worked here!
-        let len = try!({
-            let mut is = CodedInputStream::from_buffered_reader(&mut self.reader);
-            is.read_raw_varint32()
-        });
+        let mut bytes = [0; 4];
+        self.reader.read_exact(&mut bytes)?;
+        let len = BigEndian::read_u32(&bytes);
         trace!("Should read {} more bytes", len);
-        let mut buf = vec![0; len as usize];
-        try!(self.reader.read_exact(&mut buf).or_else(|e| Err(ProtobufError::IoError(e))));
+        let mut data = vec![0; len as usize];
+        self.reader.read_exact(&mut data)?;
         trace!("Done reading");
-        parse_from_bytes::<ServerResponse>(&buf)
+        Ok(serde_json::from_slice(&data)?)
     }
 }
 
