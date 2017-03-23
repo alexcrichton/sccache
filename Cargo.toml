@@ -38,13 +38,16 @@ time = "0.1.35"
 tokio-core = "0.1.6"
 tokio-proto = "0.1"
 tokio-io = "0.1"
-tokio-serde-json = { git = "https://github.com/carllerche/tokio-serde-json" }
 tokio-service = "0.1"
 tokio-tls = "0.1"
 tokio-process = "0.1"
 uuid = { version = "0.3.1", features = ["v4"] }
 which = "0.2.1"
 zip = { version = "0.1", default-features = false }
+
+[dependencies.tokio-serde-json]
+git = "https://github.com/alexcrichton/tokio-serde-json"
+branch = 'forward-sink-stream'
 
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.2.3"
