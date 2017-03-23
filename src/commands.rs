@@ -447,7 +447,7 @@ fn handle_compile_response<T>(mut creator: T,
             })?;
             if let Response::CompileFinished(result) = res {
                 trace!("Server sent CompileFinished");
-                handle_compile_finished(result, stdout, stderr)
+                return handle_compile_finished(result, stdout, stderr)
             } else {
                 bail!("unexpected response from server")
             }
