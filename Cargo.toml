@@ -69,6 +69,10 @@ simple-s3 = []
 unstable = []
 
 [profile.release]
-debug = true
+#debug = true
 
 [workspace]
+
+[replace]
+'mio:0.6.6' = { git = 'https://github.com/alexcrichton/mio', branch = 'ignore-epipe-osx' }
+'serde:0.9.12' = { git = 'https://github.com/serde-rs/serde' }
