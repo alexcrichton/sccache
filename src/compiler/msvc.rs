@@ -20,14 +20,14 @@ use ::compiler::{
 use compiler::c::{CCompilerImpl, CCompilerKind, ParsedArguments};
 use local_encoding::{Encoding, Encoder};
 use log::LogLevel::{Debug, Trace};
-use futures::future::Future;
+use futures::prelude::*;
 use futures_cpupool::CpuPool;
 use mock_command::{
     CommandCreatorSync,
     RunCommand,
 };
 use std::collections::{HashMap,HashSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs::File;
 use std::io::{
     self,
@@ -91,76 +91,65 @@ fn from_local_codepage(bytes: &Vec<u8>) -> io::Result<String> {
 }
 
 /// Detect the prefix included in the output of MSVC's -showIncludes output.
-pub fn detect_showincludes_prefix<T>(creator: &T, exe: &OsStr, pool: &CpuPool)
-                                     -> SFuture<String>
+#[async]
+pub fn detect_showincludes_prefix<T>(mut creator: T,
+                                     exe: OsString,
+                                     pool: CpuPool)
+                                     -> Result<String>
     where T: CommandCreatorSync
 {
-    let write = write_temp_file(pool,
-                                "test.c".as_ref(),
-                                b"#include \"test.h\"\n".to_vec());
+    let pair = await!(write_temp_file(pool.clone(),
+                                      "test.c".into(),
+                                      b"#include \"test.h\"\n".to_vec()))?;
+    let (tempdir, input) = pair;
 
-    let exe = exe.to_os_string();
-    let mut creator = creator.clone();
-    let pool = pool.clone();
-    let write2 = write.and_then(move |(tempdir, input)| {
-        let header = tempdir.path().join("test.h");
-        pool.spawn_fn(move || -> Result<_> {
-            let mut file = File::create(&header)?;
-            file.write_all(b"/* empty */\n")?;
-            Ok((tempdir, input))
-        }).chain_err(|| {
-            "failed to write temporary file"
-        })
-    });
-    let output = write2.and_then(move |(tempdir, input)| {
-        let mut cmd = creator.new_command_sync(&exe);
-        cmd.args(&["-nologo", "-showIncludes", "-c", "-Fonul", "-I."])
-            .arg(&input)
-            .current_dir(&tempdir.path())
+    let header = tempdir.path().join("test.h");
+    await!(pool.spawn_fn(move || -> Result<_> {
+        let mut file = File::create(&header)?;
+        file.write_all(b"/* empty */\n")?;
+        Ok(())
+    })).chain_err(|| {
+        "failed to write temporary file"
+    })?;
+
+    let mut cmd = creator.new_command_sync(&exe);
+    cmd.args(&["-nologo", "-showIncludes", "-c", "-Fonul", "-I."])
+        .arg(&input)
+        .current_dir(&tempdir.path())
         // The MSDN docs say the -showIncludes output goes to stderr,
         // but that's not true unless running with -E.
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
 
-        if log_enabled!(Trace) {
-            trace!("detect_showincludes_prefix: {:?}", cmd);
-        }
+    if log_enabled!(Trace) {
+        trace!("detect_showincludes_prefix: {:?}", cmd);
+    }
 
-        run_input_output(cmd, None).map(|e| {
-            // Keep the tempdir around so test.h still exists for the
-            // checks below.
-            (e, tempdir)
-        })
-    });
+    let output = await!(run_input_output(cmd, None))?;
+    if !output.status.success() {
+        bail!("Failed to detect showIncludes prefix")
+    }
 
-    Box::new(output.and_then(|(output, tempdir)| {
-        if !output.status.success() {
-            bail!("Failed to detect showIncludes prefix")
-        }
-
-        let process::Output { stdout: stdout_bytes, .. } = output;
-        let stdout = try!(from_local_codepage(&stdout_bytes));
-        for line in stdout.lines() {
-            if line.ends_with("test.h") {
-                for (i, c) in line.char_indices().rev() {
-                    if c == ' ' {
-                        // See if the rest of this line is a full pathname.
-                        if Path::new(&line[i+1..]).exists() {
-                            // Everything from the beginning of the line
-                            // to this index is the prefix.
-                            return Ok(line[..i+1].to_owned());
-                        }
+    let process::Output { stdout: stdout_bytes, .. } = output;
+    let stdout = from_local_codepage(&stdout_bytes)?;
+    for line in stdout.lines() {
+        if line.ends_with("test.h") {
+            for (i, c) in line.char_indices().rev() {
+                if c == ' ' {
+                    // See if the rest of this line is a full pathname.
+                    if Path::new(&line[i+1..]).exists() {
+                        // Everything from the beginning of the line
+                        // to this index is the prefix.
+                        return Ok(line[..i+1].to_owned());
                     }
                 }
             }
         }
-        drop(tempdir);
+    }
 
-        debug!("failed to detect showIncludes prefix with output: {}",
-               stdout);
+    debug!("failed to detect showIncludes prefix with output: {}", stdout);
 
-        bail!("Failed to detect showIncludes prefix")
-    }))
+    bail!("Failed to detect showIncludes prefix")
 }
 
 #[cfg(unix)]
@@ -487,7 +476,9 @@ fn compile<T>(creator: &T,
             Some(name) => name,
             None => return f_err("missing input filename"),
         };
-        write_temp_file(pool, filename.as_ref(), preprocessor_result.stdout)
+        write_temp_file(pool.clone(),
+                        filename.into(),
+                        preprocessor_result.stdout)
     };
 
     let mut fo = OsString::from("-Fo");

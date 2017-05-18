@@ -92,7 +92,7 @@ pub trait CommandChild {
 }
 
 /// A trait that provides a subset of the methods of `std::process::Command`.
-pub trait RunCommand: fmt::Debug {
+pub trait RunCommand: fmt::Debug + 'static {
     /// The type returned by `spawn`.
     type C: CommandChild + 'static;
 

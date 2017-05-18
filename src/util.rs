@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use futures::Future;
-use futures::future;
+use futures::prelude::*;
 use futures_cpupool::CpuPool;
 use mock_command::{CommandChild, RunCommand};
 use ring::digest::{SHA512, Context};
@@ -42,8 +41,12 @@ impl Digest {
     pub fn file<T>(path: T, pool: &CpuPool) -> SFuture<String>
         where T: Into<PathBuf>
     {
-        let path = path.into();
-        Box::new(pool.spawn_fn(move || -> Result<_> {
+        Digest::_file(path.into(), pool.clone())
+    }
+
+    #[async(boxed)]
+    fn _file(path: PathBuf, pool: CpuPool) -> Result<String> {
+        await!(pool.spawn_fn(move || -> Result<_> {
             let f = File::open(&path).chain_err(|| format!("Failed to open file for hashing: {:?}", path))?;
             let mut m = Digest::new();
             let mut reader = BufReader::new(f);
@@ -94,8 +97,9 @@ pub fn fmt_duration_as_secs(duration: &Duration) -> String
 ///
 /// This was lifted from `std::process::Child::wait_with_output` and modified
 /// to also write to stdin.
+#[async]
 fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>)
-                             -> SFuture<process::Output>
+                             -> Result<process::Output>
     where T: CommandChild + 'static,
 {
     use tokio_io::io::{write_all, read_to_end};
@@ -115,23 +119,23 @@ fn wait_with_input_output<T>(mut child: T, input: Option<Vec<u8>>)
         child.wait().chain_err(|| "failed to wait for child")
     });
 
-    Box::new(status.join3(stdout, stderr).map(|(status, out, err)| {
-        let stdout = out.map(|p| p.1);
-        let stderr = err.map(|p| p.1);
-        process::Output {
-            status: status,
-            stdout: stdout.unwrap_or_default(),
-            stderr: stderr.unwrap_or_default(),
-        }
-    }))
+    let (status, out, err) = await!(status.join3(stdout, stderr))?;
+    let stdout = out.map(|p| p.1);
+    let stderr = err.map(|p| p.1);
+    Ok(process::Output {
+        status: status,
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
+    })
 }
 
 /// Run `command`, writing `input` to its stdin if it is `Some` and return the exit status and output.
 ///
 /// If the command returns a non-successful exit status, an error of `ErrorKind::ProcessError`
 /// will be returned containing the process output.
+#[async]
 pub fn run_input_output<C>(mut command: C, input: Option<Vec<u8>>)
-                           -> SFuture<process::Output>
+                           -> Result<process::Output>
     where C: RunCommand
 {
     let child = command
@@ -140,18 +144,14 @@ pub fn run_input_output<C>(mut command: C, input: Option<Vec<u8>>)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .chain_err(|| "failed to spawn child");
+        .chain_err(|| "failed to spawn child")?;
 
-    Box::new(future::result(child)
-             .and_then(|child| {
-                 wait_with_input_output(child, input).and_then(|output| {
-                     if output.status.success() {
-                         f_ok(output)
-                     } else {
-                         f_err(ErrorKind::ProcessError(output))
-                     }
-                 })
-             }))
+    let output = await!(wait_with_input_output(child, input))?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(ErrorKind::ProcessError(output).into())
+    }
 }
 
 pub trait OsStrExt {

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![feature(proc_macro, conservative_impl_trait, generators)]
+
 extern crate app_dirs;
 extern crate bincode;
 extern crate byteorder;
@@ -28,7 +30,7 @@ extern crate env_logger;
 extern crate error_chain;
 extern crate filetime;
 #[macro_use]
-extern crate futures;
+extern crate futures_await as futures;
 extern crate futures_cpupool;
 #[cfg(feature = "hyper")]
 extern crate hyper;

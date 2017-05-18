@@ -111,7 +111,7 @@ fn compile<T>(creator: &T,
             Some(name) => name,
             None => return future::err("missing input filename".into()).boxed(),
         };
-        write_temp_file(pool, filename.as_ref(), preprocessor_result.stdout)
+        write_temp_file(pool.clone(), filename.into(), preprocessor_result.stdout)
     };
     let input = parsed_args.input.clone();
     let out_file = match parsed_args.outputs.get("obj") {

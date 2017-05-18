@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use compiler::{Cacheable, Compiler, CompilerArguments, CompilerHasher, CompilerKind, Compilation, HashResult};
-use futures::Future;
+use futures::prelude::*;
 use futures_cpupool::CpuPool;
 use mock_command::CommandCreatorSync;
 use std::borrow::Cow;
@@ -131,15 +131,17 @@ pub trait CCompilerImpl: Clone + fmt::Debug + Send + 'static {
 impl <I> CCompiler<I>
     where I: CCompilerImpl,
 {
-    pub fn new(compiler: I, executable: PathBuf, pool: &CpuPool) -> SFuture<CCompiler<I>>
+    #[async]
+    pub fn new(compiler: I,
+               executable: PathBuf,
+               pool: CpuPool) -> Result<CCompiler<I>>
     {
-        Box::new(Digest::file(executable.clone(), &pool).map(move |digest| {
-            CCompiler {
-                executable: executable,
-                executable_digest: digest,
-                compiler: compiler,
-            }
-        }))
+        let digest = await!(Digest::file(executable.clone(), &pool))?;
+        Ok(CCompiler {
+            executable: executable,
+            executable_digest: digest,
+            compiler: compiler,
+        })
     }
 }
 
@@ -172,15 +174,20 @@ impl<T, I> CompilerHasher<T> for CCompilerHasher<I>
           I: CCompilerImpl,
 {
     fn generate_hash_key(self: Box<Self>,
-                         creator: &T,
-                         cwd: &Path,
-                         env_vars: &[(OsString, OsString)],
-                         pool: &CpuPool)
+                         creator: T,
+                         cwd: PathBuf,
+                         env_vars: Vec<(OsString, OsString)>,
+                         pool: CpuPool)
                          -> SFuture<HashResult<T>>
     {
         let me = *self;
         let CCompilerHasher { parsed_args, executable, executable_digest, compiler } = me;
-        let result = compiler.preprocess(creator, &executable, &parsed_args, cwd, env_vars, pool);
+        let result = compiler.preprocess(&creator,
+                                         &executable,
+                                         &parsed_args,
+                                         &cwd,
+                                         &env_vars,
+                                         &pool);
         let out_pretty = parsed_args.output_pretty().into_owned();
         let env_vars = env_vars.to_vec();
         let result = result.map_err(move |e| {

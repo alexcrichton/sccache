@@ -23,7 +23,8 @@ use compiler::clang::Clang;
 use compiler::gcc::GCC;
 use compiler::msvc::MSVC;
 use compiler::rust::Rust;
-use futures::{Future, IntoFuture};
+use futures::prelude::*;
+use futures::future::{self, Either};
 use futures_cpupool::CpuPool;
 use mock_command::{
     CommandChild,
@@ -88,181 +89,11 @@ pub trait CompilerHasher<T>: fmt::Debug + Send + 'static
     /// that can be used for cache lookups, as well as any additional
     /// information that can be reused for compilation if necessary.
     fn generate_hash_key(self: Box<Self>,
-                         creator: &T,
-                         cwd: &Path,
-                         env_vars: &[(OsString, OsString)],
-                         pool: &CpuPool)
+                         creator: T,
+                         cwd: PathBuf,
+                         env_vars: Vec<(OsString, OsString)>,
+                         pool: CpuPool)
                          -> SFuture<HashResult<T>>;
-    /// Look up a cached compile result in `storage`. If not found, run the
-    /// compile and store the result.
-    fn get_cached_or_compile(self: Box<Self>,
-                             creator: T,
-                             storage: Arc<Storage>,
-                             arguments: Vec<OsString>,
-                             cwd: PathBuf,
-                             env_vars: Vec<(OsString, OsString)>,
-                             cache_control: CacheControl,
-                             pool: CpuPool,
-                             handle: Handle)
-                             -> SFuture<(CompileResult, process::Output)>
-    {
-        let out_pretty = self.output_pretty().into_owned();
-        debug!("[{}]: get_cached_or_compile: {:?}", out_pretty, arguments);
-        let start = Instant::now();
-        let result = self.generate_hash_key(&creator, &cwd, &env_vars, &pool);
-        Box::new(result.then(move |res| -> SFuture<_> {
-            debug!("[{}]: generate_hash_key took {}", out_pretty, fmt_duration_as_secs(&start.elapsed()));
-            let (key, compilation) = match res {
-                Err(Error(ErrorKind::ProcessError(output), _)) => {
-                    return f_ok((CompileResult::Error, output));
-                }
-                Err(e) => return f_err(e),
-                Ok(HashResult { key, compilation }) => (key, compilation),
-            };
-            trace!("[{}]: Hash key: {}", out_pretty, key);
-            // If `ForceRecache` is enabled, we won't check the cache.
-            let start = Instant::now();
-            let cache_status = if cache_control == CacheControl::ForceRecache {
-                f_ok(Cache::Recache)
-            } else {
-                storage.get(&key)
-            };
-
-            // Set a maximum time limit for the cache to respond before we forge
-            // ahead ourselves with a compilation.
-            let timeout = Duration::new(60, 0);
-            let timeout = Timeout::new(timeout, &handle).into_future().flatten();
-
-            let cache_status = cache_status.map(Some);
-            let timeout = timeout.map(|_| None).chain_err(|| "timeout error");
-            let cache_status = cache_status.select(timeout).then(|r| {
-                match r {
-                    Ok((e, _other)) => Ok(e),
-                    Err((e, _other)) => Err(e),
-                }
-            });
-
-            // Check the result of the cache lookup.
-            Box::new(cache_status.then(move |result| {
-                let duration = start.elapsed();
-                let pwd = Path::new(&cwd);
-                let outputs = compilation.outputs()
-                    .map(|(key, path)| (key.to_string(), pwd.join(path)))
-                    .collect::<HashMap<_, _>>();
-
-                let miss_type = match result {
-                    Ok(Some(Cache::Hit(mut entry))) => {
-                        debug!("[{}]: Cache hit in {}", out_pretty, fmt_duration_as_secs(&duration));
-                        let mut stdout = Vec::new();
-                        let mut stderr = Vec::new();
-                        drop(entry.get_object("stdout", &mut stdout));
-                        drop(entry.get_object("stderr", &mut stderr));
-                        let write = pool.spawn_fn(move ||{
-                            for (key, path) in &outputs {
-                                let mut f = File::create(&path)?;
-                                let mode = entry.get_object(&key, &mut f)?;
-                                if let Some(mode) = mode {
-                                    set_file_mode(&path, mode)?;
-                                }
-                            }
-                            Ok(())
-                        });
-                        let output = process::Output {
-                            status: exit_status(0),
-                            stdout: stdout,
-                            stderr: stderr,
-                        };
-                        let result = CompileResult::CacheHit(duration);
-                        return Box::new(write.map(|_| {
-                            (result, output)
-                        })) as SFuture<_>
-                    }
-                    Ok(Some(Cache::Miss)) => {
-                        debug!("[{}]: Cache miss", out_pretty);
-                        MissType::Normal
-                    }
-                    Ok(Some(Cache::Recache)) => {
-                        debug!("[{}]: Cache recache", out_pretty);
-                        MissType::ForcedRecache
-                    }
-                    Ok(None) => {
-                        debug!("[{}]: Cache timed out", out_pretty);
-                        MissType::TimedOut
-                    }
-                    Err(err) => {
-                        error!("[{}]: Cache read error: {}", out_pretty, err);
-                        for e in err.iter().skip(1) {
-                            error!("[{}] \t{}", out_pretty, e);
-                        }
-                        MissType::CacheReadError
-                    }
-                };
-
-                // Cache miss, so compile it.
-                let start = Instant::now();
-                let out_pretty = out_pretty.clone();
-                let compile = compilation.compile(&creator, &cwd, &env_vars, &pool);
-                Box::new(compile.and_then(move |(cacheable, compiler_result)| {
-                    let duration = start.elapsed();
-                    if !compiler_result.status.success() {
-                        debug!("[{}]: Compiled but failed, not storing in cache",
-                               out_pretty);
-                        return f_ok((CompileResult::CompileFailed, compiler_result))
-                            as SFuture<_>
-                    }
-                    if cacheable != Cacheable::Yes {
-                        // Not cacheable
-                        debug!("[{}]: Compiled but not cacheable",
-                               out_pretty);
-                        return f_ok((CompileResult::NotCacheable, compiler_result))
-                    }
-                    debug!("[{}]: Compiled in {}, storing in cache", out_pretty, fmt_duration_as_secs(&duration));
-                    let write = pool.spawn_fn(move || -> Result<_> {
-                        let mut entry = CacheWrite::new();
-                        for (key, path) in &outputs {
-                            let mut f = File::open(&path)?;
-                            let mode = get_file_mode(&path)?;
-                            entry.put_object(key, &mut f, mode).chain_err(|| {
-                                format!("failed to put object `{:?}` in zip", path)
-                            })?;
-                        }
-                        Ok(entry)
-                    });
-                    let write = write.chain_err(|| "failed to zip up compiler outputs");
-                    let o = out_pretty.clone();
-                    Box::new(write.and_then(move |mut entry| {
-                        if !compiler_result.stdout.is_empty() {
-                            let mut stdout = &compiler_result.stdout[..];
-                            entry.put_object("stdout", &mut stdout, None)?;
-                        }
-                        if !compiler_result.stderr.is_empty() {
-                            let mut stderr = &compiler_result.stderr[..];
-                            entry.put_object("stderr", &mut stderr, None)?;
-                        }
-
-                        // Try to finish storing the newly-written cache
-                        // entry. We'll get the result back elsewhere.
-                        let out_pretty = out_pretty.clone();
-                        let future = storage.put(&key, entry)
-                            .then(move |res| {
-                                match res {
-                                    Ok(_) => debug!("[{}]: Stored in cache successfully!", out_pretty),
-                                    Err(ref e) => debug!("[{}]: Cache write error: {:?}", out_pretty, e),
-                                }
-                                res.map(|duration| CacheWriteInfo {
-                                    object_file_pretty: out_pretty,
-                                    duration: duration,
-                                })
-                            });
-                        let future = Box::new(future);
-                        Ok((CompileResult::CacheMiss(miss_type, duration, future), compiler_result))
-                    }).chain_err(move || {
-                        format!("failed to store `{}` to cache", o)
-                    }))
-                }))
-            }))
-        }))
-    }
 
     /// A descriptive string about the file that we're going to be producing.
     ///
@@ -271,6 +102,177 @@ pub trait CompilerHasher<T>: fmt::Debug + Send + 'static
     fn output_pretty(&self) -> Cow<str>;
 
     fn box_clone(&self) -> Box<CompilerHasher<T>>;
+}
+
+impl<T: CommandCreatorSync> CompilerHasher<T> {
+    /// Look up a cached compile result in `storage`. If not found, run the
+    /// compile and store the result.
+    #[async]
+    pub fn get_cached_or_compile(self: Box<Self>,
+                                 creator: T,
+                                 storage: Arc<Storage>,
+                                 arguments: Vec<OsString>,
+                                 cwd: PathBuf,
+                                 env_vars: Vec<(OsString, OsString)>,
+                                 cache_control: CacheControl,
+                                 pool: CpuPool,
+                                 handle: Handle)
+                                 -> Result<(CompileResult, process::Output)>
+    {
+        let out_pretty = self.output_pretty().into_owned();
+        debug!("[{}]: get_cached_or_compile: {:?}", out_pretty, arguments);
+        let start = Instant::now();
+        let result = await!(self.generate_hash_key(creator.clone(),
+                                                   cwd.clone(),
+                                                   env_vars.clone(),
+                                                   pool.clone()));
+        debug!("[{}]: generate_hash_key took {}",
+               out_pretty,
+               fmt_duration_as_secs(&start.elapsed()));
+
+        let (key, compilation) = match result {
+            Err(Error(ErrorKind::ProcessError(output), _)) => {
+                return Ok((CompileResult::Error, output));
+            }
+            Err(e) => return Err(e),
+            Ok(HashResult { key, compilation }) => (key, compilation),
+        };
+
+        trace!("[{}]: Hash key: {}", out_pretty, key);
+        // If `ForceRecache` is enabled, we won't check the cache.
+        let start = Instant::now();
+        let cache_status = if cache_control == CacheControl::ForceRecache {
+            Either::A(future::ok(Cache::Recache))
+        } else {
+            Either::B(storage.get(&key))
+        };
+
+        // Set a maximum time limit for the cache to respond before we forge
+        // ahead ourselves with a compilation.
+        let timeout = Duration::new(60, 0);
+        let timeout = Timeout::new(timeout, &handle)?;
+
+        let cache_status = cache_status.map(Some);
+        let timeout = timeout.map(|()| None).chain_err(|| "timeout error");
+        let result = await!(cache_status.select(timeout).then(|r| {
+            match r {
+                Ok((e, _other)) => Ok(e),
+                Err((e, _other)) => Err(e),
+            }
+        }));
+
+        // Check the result of the cache lookup.
+        let duration = start.elapsed();
+        let pwd = Path::new(&cwd);
+        let outputs = compilation.outputs()
+            .map(|(key, path)| (key.to_string(), pwd.join(path)))
+            .collect::<HashMap<_, _>>();
+
+        let miss_type = match result {
+            Ok(Some(Cache::Hit(mut entry))) => {
+                debug!("[{}]: Cache hit in {}", out_pretty, fmt_duration_as_secs(&duration));
+                let mut stdout = Vec::new();
+                let mut stderr = Vec::new();
+                drop(entry.get_object("stdout", &mut stdout));
+                drop(entry.get_object("stderr", &mut stderr));
+                await!(pool.spawn_fn(move || -> Result<_> {
+                    for (key, path) in &outputs {
+                        let mut f = File::create(&path)?;
+                        let mode = entry.get_object(&key, &mut f)?;
+                        if let Some(mode) = mode {
+                            set_file_mode(&path, mode)?;
+                        }
+                    }
+                    Ok(())
+                }))?;
+                let output = process::Output {
+                    status: exit_status(0),
+                    stdout: stdout,
+                    stderr: stderr,
+                };
+                let result = CompileResult::CacheHit(duration);
+                return Ok((result, output))
+            }
+            Ok(Some(Cache::Miss)) => {
+                debug!("[{}]: Cache miss", out_pretty);
+                MissType::Normal
+            }
+            Ok(Some(Cache::Recache)) => {
+                debug!("[{}]: Cache recache", out_pretty);
+                MissType::ForcedRecache
+            }
+            Ok(None) => {
+                debug!("[{}]: Cache timed out", out_pretty);
+                MissType::TimedOut
+            }
+            Err(err) => {
+                error!("[{}]: Cache read error: {}", out_pretty, err);
+                for e in err.iter().skip(1) {
+                    error!("[{}] \t{}", out_pretty, e);
+                }
+                MissType::CacheReadError
+            }
+        };
+
+        // Cache miss, so compile it.
+        let start = Instant::now();
+        let compile = await!(compilation.compile(&creator,
+                                                 &cwd,
+                                                 &env_vars,
+                                                 &pool))?;
+        let (cacheable, compiler_result) = compile;
+        let duration = start.elapsed();
+        if !compiler_result.status.success() {
+            debug!("[{}]: Compiled but failed, not storing in cache", out_pretty);
+            return Ok((CompileResult::CompileFailed, compiler_result))
+        }
+        if cacheable != Cacheable::Yes {
+            // Not cacheable
+            debug!("[{}]: Compiled but not cacheable", out_pretty);
+            return Ok((CompileResult::NotCacheable, compiler_result))
+        }
+        debug!("[{}]: Compiled in {}, storing in cache",
+               out_pretty,
+               fmt_duration_as_secs(&duration));
+
+        let mut entry = await!(pool.spawn_fn(move || -> Result<_> {
+            let mut entry = CacheWrite::new();
+            for (key, path) in &outputs {
+                let mut f = File::open(&path)?;
+                let mode = get_file_mode(&path)?;
+                entry.put_object(key, &mut f, mode).chain_err(|| {
+                    format!("failed to put object `{:?}` in zip", path)
+                })?;
+            }
+            Ok(entry)
+        })).chain_err(|| {
+            "failed to zip up compiler outputs"
+        })?;
+        if !compiler_result.stdout.is_empty() {
+            let mut stdout = &compiler_result.stdout[..];
+            entry.put_object("stdout", &mut stdout, None)?;
+        }
+        if !compiler_result.stderr.is_empty() {
+            let mut stderr = &compiler_result.stderr[..];
+            entry.put_object("stderr", &mut stderr, None)?;
+        }
+
+        // Try to finish storing the newly-written cache
+        // entry. We'll get the result back elsewhere.
+        let future = storage.put(&key, entry).then(move |res| {
+            match res {
+                Ok(_) => debug!("[{}]: Stored in cache successfully!", out_pretty),
+                Err(ref e) => debug!("[{}]: Cache write error: {:?}", out_pretty, e),
+            }
+            res.map(|duration| CacheWriteInfo {
+                object_file_pretty: out_pretty,
+                duration: duration,
+            })
+        });
+        let future = Box::new(future);
+        Ok((CompileResult::CacheMiss(miss_type, duration, Box::new(future)),
+            compiler_result))
+    }
 }
 
 impl<T: CommandCreatorSync> Clone for Box<CompilerHasher<T>> {
@@ -434,33 +436,36 @@ pub enum CacheControl {
 ///
 /// Note that when the `TempDir` is dropped it will delete all of its contents
 /// including the path returned.
-pub fn write_temp_file(pool: &CpuPool, path: &Path, contents: Vec<u8>)
-                       -> SFuture<(TempDir, PathBuf)> {
-    let path = path.to_owned();
-    pool.spawn_fn(move || -> Result<_> {
+#[async]
+pub fn write_temp_file(pool: CpuPool, path: PathBuf, contents: Vec<u8>)
+                       -> Result<(TempDir, PathBuf)> {
+    let pair = await!(pool.spawn_fn(move || -> Result<_> {
         let dir = TempDir::new("sccache")?;
         let src = dir.path().join(path);
         let mut file = File::create(&src)?;
         file.write_all(&contents)?;
         Ok((dir, src))
-    }).chain_err(|| {
+    })).chain_err(|| {
         "failed to write temporary file"
-    })
+    })?;
+    Ok(pair)
 }
 
 /// If `executable` is a known compiler, return `Some(Box<Compiler>)`.
-fn detect_compiler<T>(creator: &T, executable: &Path, pool: &CpuPool)
-                      -> SFuture<Option<Box<Compiler<T>>>>
+#[async]
+fn detect_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
+                      -> Result<Option<Box<Compiler<T>>>>
     where T: CommandCreatorSync
 {
     trace!("detect_compiler");
 
     // First, see if this looks like rustc.
-    let filename = match executable.file_stem() {
-        None => return f_err("could not determine compiler kind"),
-        Some(f) => f,
+    let looks_like_rustc = match executable.file_stem() {
+        None => bail!("could not determine compiler kind"),
+        Some(f) => f.to_string_lossy().to_lowercase() == "rustc",
     };
-    let is_rustc = if filename.to_string_lossy().to_lowercase() == "rustc" {
+    let mut is_rustc = false;
+    if looks_like_rustc {
         // Sanity check that it's really rustc.
         let child = creator.clone().new_command_sync(&executable)
             .stdout(Stdio::piped())
@@ -468,40 +473,31 @@ fn detect_compiler<T>(creator: &T, executable: &Path, pool: &CpuPool)
             .args(&["--version"])
             .spawn().chain_err(|| {
                 format!("failed to execute {:?}", executable)
-            });
-        let output = child.into_future().and_then(move |child| {
-            child.wait_with_output()
-                .chain_err(|| "failed to read child output")
-        });
-        Box::new(output.map(|output| {
-            if output.status.success() {
-                if let Ok(stdout) = String::from_utf8(output.stdout) {
-                    if stdout.starts_with("rustc ") {
-                        return true;
-                    }
+            })?;
+        let output = await!(child.wait_with_output()).chain_err(|| {
+            "failed to read child output"
+        })?;
+        if output.status.success() {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                if stdout.starts_with("rustc ") {
+                    is_rustc = true;
                 }
             }
-            false
-        }))
-    } else {
-        f_ok(false)
-    };
-
-    let creator = creator.clone();
-    let executable = executable.to_owned();
-    let pool = pool.clone();
-    Box::new(is_rustc.and_then(move |is_rustc| {
-        if is_rustc {
-            debug!("Found rustc");
-            Box::new(Rust::new(creator, executable, pool).map(|c| Some(Box::new(c) as Box<Compiler<T>>)))
-        } else {
-            detect_c_compiler(creator, executable, pool)
         }
-    }))
+    }
+
+    if is_rustc {
+        debug!("Found rustc");
+        let rust = await!(Rust::new(creator, executable, pool))?;
+        Ok(Some(Box::new(rust) as Box<Compiler<T>>))
+    } else {
+        await!(detect_c_compiler(creator, executable, pool))
+    }
 }
 
+#[async]
 fn detect_c_compiler<T>(creator: T, executable: PathBuf, pool: CpuPool)
-                        -> SFuture<Option<Box<Compiler<T>>>>
+                        -> Result<Option<Box<Compiler<T>>>>
     where T: CommandCreatorSync
 {
     trace!("detect_c_compiler");
@@ -514,72 +510,65 @@ clang
 gcc
 #endif
 ".to_vec();
-    let write = write_temp_file(&pool, "testfile.c".as_ref(), test);
+    let (tempdir, src) = await!(write_temp_file(pool.clone(),
+                                                "testfile.c".into(),
+                                                test))?;
 
     let mut cmd = creator.clone().new_command_sync(&executable);
     cmd.stdout(Stdio::piped())
-       .stderr(Stdio::null());
-    let output = write.and_then(move |(tempdir, src)| {
-        cmd.arg("-E").arg(src);
-        trace!("compiler {:?}", cmd);
-        let child = cmd.spawn().chain_err(|| {
-            format!("failed to execute {:?}", cmd)
-        });
-        child.into_future().and_then(|child| {
-            child.wait_with_output().chain_err(|| "failed to read child output")
-        }).map(|e| {
-            drop(tempdir);
-            e
-        })
-    });
+       .stderr(Stdio::null())
+       .arg("-E")
+       .arg(src);
+    trace!("compiler {:?}", cmd);
+    let child = cmd.spawn().chain_err(|| {
+        format!("failed to execute {:?}", cmd)
+    })?;
+    let output = await!(child.wait_with_output().chain_err(|| {
+        "failed to read child output"
+    }))?;
+    drop(tempdir);
 
-    Box::new(output.and_then(move |output| -> SFuture<_> {
-        let stdout = match str::from_utf8(&output.stdout) {
-            Ok(s) => s,
-            Err(_) => return f_err("Failed to parse output"),
-        };
-        for line in stdout.lines() {
-            //TODO: do something smarter here.
-            if line == "gcc" {
-                debug!("Found GCC");
-                return Box::new(CCompiler::new(GCC, executable, &pool)
-                                .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
-            } else if line == "clang" {
-                debug!("Found clang");
-                return Box::new(CCompiler::new(Clang, executable, &pool)
-                                .map(|c| Some(Box::new(c) as Box<Compiler<T>>)));
-            } else if line == "msvc" {
-                debug!("Found MSVC");
-                let prefix = msvc::detect_showincludes_prefix(&creator,
-                                                              executable.as_ref(),
-                                                              &pool);
-                return Box::new(prefix.and_then(move |prefix| {
-                    trace!("showIncludes prefix: '{}'", prefix);
-                    CCompiler::new(MSVC {
-                        includes_prefix: prefix,
-                    }, executable, &pool)
-                        .map(|c| Some(Box::new(c) as Box<Compiler<T>>))
-                }))
-            }
+    let stdout = match String::from_utf8(output.stdout) {
+        Ok(s) => s,
+        Err(_) => bail!("failed to parse output"),
+    };
+    for line in stdout.lines() {
+        //TODO: do something smarter here.
+        if line == "gcc" {
+            debug!("Found GCC");
+            let c = await!(CCompiler::new(GCC, executable, pool))?;
+            return Ok(Some(Box::new(c) as Box<Compiler<T>>))
+        } else if line == "clang" {
+            debug!("Found clang");
+            let c = await!(CCompiler::new(Clang, executable, pool))?;
+            return Ok(Some(Box::new(c) as Box<Compiler<T>>))
+        } else if line == "msvc" {
+            debug!("Found MSVC");
+            let prefix = await!(msvc::detect_showincludes_prefix(creator,
+                                                                 executable.clone().into(),
+                                                                 pool.clone()))?;
+            trace!("showIncludes prefix: '{}'", prefix);
+            let c = await!(CCompiler::new(MSVC {
+                includes_prefix: prefix,
+            }, executable, pool))?;
+            return Ok(Some(Box::new(c) as Box<Compiler<T>>))
         }
-        debug!("nothing useful in detection output {:?}", stdout);
-        f_ok(None)
-    }))
+    }
+    debug!("nothing useful in detection output {:?}", stdout);
+    Ok(None)
 }
 
 /// If `executable` is a known compiler, return a `Box<Compiler>` containing information about it.
-pub fn get_compiler_info<T>(creator: &T, executable: &Path, pool: &CpuPool)
-                            -> SFuture<Box<Compiler<T>>>
+#[async]
+pub fn get_compiler_info<T>(creator: T, executable: PathBuf, pool: CpuPool)
+                            -> Result<Box<Compiler<T>>>
     where T: CommandCreatorSync
 {
     let pool = pool.clone();
-    let detect = detect_compiler(creator, executable, &pool);
-    Box::new(detect.and_then(move |compiler| -> Result<_> {
-        match compiler {
-            Some(compiler) => Ok(compiler),
-            None => bail!("could not determine compiler kind"),
-        }
-    }))
+    match await!(detect_compiler(creator, executable, pool))? {
+        Some(compiler) => Ok(compiler),
+        None => bail!("could not determine compiler kind"),
+    }
 }
 
 #[cfg(test)]

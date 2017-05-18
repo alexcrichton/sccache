@@ -3,13 +3,14 @@
 
 use std::ascii::AsciiExt;
 use std::fmt;
+use std::rc::Rc;
 
 use crypto::digest::Digest;
 use crypto::hmac::Hmac;
 use crypto::mac::Mac;
 use crypto::sha1::Sha1;
-use futures::{Future, Stream};
-use hyper::{self, header};
+use futures::prelude::*;
+use hyper::header;
 use hyper::Method;
 use hyper::client::{Client, Request};
 use hyper_tls::HttpsConnector;
@@ -50,7 +51,12 @@ fn signature(string_to_sign: &str, signing_key: &str) -> String {
 }
 
 /// An S3 bucket.
+#[derive(Clone)]
 pub struct Bucket {
+    inner: Rc<Inner>,
+}
+
+struct Inner {
     name: String,
     base_url: String,
     client: Client<HttpsConnector>,
@@ -58,7 +64,9 @@ pub struct Bucket {
 
 impl fmt::Display for Bucket {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Bucket(name={}, base_url={})", self.name, self.base_url)
+        write!(f, "Bucket(name={}, base_url={})",
+               self.inner.name,
+               self.inner.base_url)
     }
 }
 
@@ -66,50 +74,49 @@ impl Bucket {
     pub fn new(name: &str, endpoint: &str, ssl: Ssl, handle: &Handle) -> Bucket {
         let base_url = base_url(&endpoint, ssl);
         Bucket {
-            name: name.to_owned(),
-            base_url: base_url,
-            client: Client::configure()
-                        .connector(HttpsConnector::new(1, handle))
-                        .build(handle),
+            inner: Rc::new(Inner {
+                name: name.to_owned(),
+                base_url: base_url,
+                client: Client::configure()
+                            .connector(HttpsConnector::new(1, handle))
+                            .build(handle),
+            }),
         }
     }
 
-    pub fn get(&self, key: &str) -> SFuture<Vec<u8>> {
-        let url = format!("{}{}", self.base_url, key);
+    // TODO: this should fail to compile due to borrowed args
+    #[async]
+    pub fn get(self, key: String) -> Result<Vec<u8>> {
+        let url = format!("{}{}", self.inner.base_url, key);
         debug!("GET {}", url);
         let url2 = url.clone();
-        Box::new(self.client.get(url.parse().unwrap()).chain_err(move || {
-            format!("failed GET: {}", url)
-        }).and_then(|res| {
-            if res.status().class() == hyper::status::StatusClass::Success {
-                let content_length = res.headers().get::<header::ContentLength>()
-                    .map(|&header::ContentLength(len)| len);
-                Ok((res.body(), content_length))
+        let res = await!(self.inner.client.get(url.parse().unwrap()))
+                    .chain_err(move || format!("failed GET: {}", url))?;
+        if !res.status().is_success() {
+            return Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
+        }
+        let content_length = res.headers().get::<header::ContentLength>()
+            .map(|&header::ContentLength(len)| len);
+        let mut bytes = Vec::new();
+        #[async]
+        for chunk in res.body() {
+            bytes.extend_from_slice(&chunk);
+        }
+        if let Some(len) = content_length {
+            if len != bytes.len() as u64 {
+                bail!(format!("Bad HTTP body size read: {}, expected {}", bytes.len(), len));
             } else {
-                Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
+                info!("Read {} bytes from {}", bytes.len(), url2);
             }
-        }).and_then(|(body, content_length)| {
-            body.fold(Vec::new(), |mut body, chunk| {
-                body.extend_from_slice(&chunk);
-                Ok::<_, hyper::Error>(body)
-            }).chain_err(|| {
-                "failed to read HTTP body"
-            }).and_then(move |bytes| {
-                if let Some(len) = content_length {
-                    if len != bytes.len() as u64 {
-                        bail!(format!("Bad HTTP body size read: {}, expected {}", bytes.len(), len));
-                    } else {
-                        info!("Read {} bytes from {}", bytes.len(), url2);
-                    }
-                }
-                Ok(bytes)
-            })
-        }))
+        }
+        Ok(bytes)
     }
 
-    pub fn put(&self, key: &str, content: Vec<u8>, creds: &AwsCredentials)
-               -> SFuture<()> {
-        let url = format!("{}{}", self.base_url, key);
+    // TODO: this should fail to compile due to borrowed args
+    #[async]
+    pub fn put(self, key: String, content: Vec<u8>, creds: AwsCredentials)
+               -> Result<()> {
+        let url = format!("{}{}", self.inner.base_url, key);
         debug!("PUT {}", url);
         let mut request = Request::new(Method::Put, url.parse().unwrap());
 
@@ -128,7 +135,7 @@ impl Bucket {
                 canonical_headers.push_str(format!("{}:{}\n", header.to_ascii_lowercase(), value).as_ref());
             }
         }
-        let auth = self.auth("PUT", &date, key, "", &canonical_headers, content_type, creds);
+        let auth = self.auth("PUT", &date, &key, "", &canonical_headers, content_type, &creds);
         request.headers_mut().set_raw("Date", vec!(date.into_bytes()));
         request.headers_mut().set(header::ContentType(content_type.parse().unwrap()));
         request.headers_mut().set(header::ContentLength(content.len() as u64));
@@ -139,23 +146,21 @@ impl Bucket {
         request.headers_mut().set_raw("Authorization", vec!(auth.into_bytes()));
         request.set_body(content);
 
-        Box::new(self.client.request(request).then(|result| {
-            match result {
-                Ok(res) => {
-                    if res.status().class() == hyper::status::StatusClass::Success {
-                        trace!("PUT succeeded");
-                        Ok(())
-                    } else {
-                        trace!("PUT failed with HTTP status: {}", res.status());
-                        Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
-                    }
-                }
-                Err(e) => {
-                    trace!("PUT failed with error: {:?}", e);
-                    Err(e.into())
+        match await!(self.inner.client.request(request)) {
+            Ok(res) => {
+                if res.status().is_success() {
+                    trace!("PUT succeeded");
+                    Ok(())
+                } else {
+                    trace!("PUT failed with HTTP status: {}", res.status());
+                    Err(ErrorKind::BadHTTPStatus(res.status().clone()).into())
                 }
             }
-        }))
+            Err(e) => {
+                trace!("PUT failed with error: {:?}", e);
+                Err(e.into())
+            }
+        }
     }
 
     // http://docs.aws.amazon.com/AmazonS3/latest/dev/RESTAuthentication.html
@@ -167,7 +172,7 @@ impl Bucket {
                              ty = content_type,
                              date = date,
                              headers = headers,
-                             resource = format!("/{}/{}", self.name, path));
+                             resource = format!("/{}/{}", self.inner.name, path));
         let signature = signature(&string, creds.aws_secret_access_key());
         format!("AWS {}:{}", creds.aws_access_key_id(), signature)
     }

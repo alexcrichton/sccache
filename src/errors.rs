@@ -68,16 +68,6 @@ impl<F> FutureChainErr<F::Item> for F
     }
 }
 
-/// Like `try`, but returns an SFuture instead of a Result.
-macro_rules! ftry {
-    ($e:expr) => {
-        match $e {
-            Ok(v) => v,
-            Err(e) => return Box::new(future::err(e.into())),
-        }
-    }
-}
-
 pub fn f_ok<T>(t: T) -> SFuture<T>
     where T: 'static,
 {

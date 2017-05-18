@@ -29,7 +29,6 @@ use simples3::{
 };
 use std::env;
 use std::io;
-use std::rc::Rc;
 use std::time::{Instant, Duration};
 use tokio_core::reactor::Handle;
 
@@ -38,7 +37,7 @@ use errors::*;
 /// A cache that stores entries in Amazon S3.
 pub struct S3Cache {
     /// The S3 bucket.
-    bucket: Rc<Bucket>,
+    bucket: Bucket,
     /// Credentials provider.
     provider: AutoRefreshingProvider<ChainProvider>,
 }
@@ -56,7 +55,7 @@ impl S3Cache {
         ];
         let provider = AutoRefreshingProvider::new(ChainProvider::with_profile_providers(profile_providers, handle));
         //TODO: configurable SSL
-        let bucket = Rc::new(Bucket::new(bucket, endpoint, Ssl::No, handle));
+        let bucket = Bucket::new(bucket, endpoint, Ssl::No, handle);
         Ok(S3Cache {
             bucket: bucket,
             provider: provider,
@@ -71,7 +70,7 @@ fn normalize_key(key: &str) -> String {
 impl Storage for S3Cache {
     fn get(&self, key: &str) -> SFuture<Cache> {
         let key = normalize_key(key);
-        Box::new(self.bucket.get(&key).then(|result| {
+        Box::new(self.bucket.clone().get(key).then(|result| {
             match result {
                 Ok(data) => {
                     let hit = CacheRead::from(io::Cursor::new(data))?;
@@ -92,13 +91,13 @@ impl Storage for S3Cache {
             Ok(data) => data,
             Err(e) => return future::err(e.into()).boxed(),
         };
-        let credentials = self.provider.credentials().chain_err(|| {
+        let credentials = self.provider.clone().credentials().chain_err(|| {
             "failed to get AWS credentials"
         });
 
         let bucket = self.bucket.clone();
         let response = credentials.and_then(move |credentials| {
-            bucket.put(&key, data, &credentials).chain_err(|| {
+            bucket.put(key, data, credentials).chain_err(|| {
                 "failed to put cache entry in s3"
             })
         });

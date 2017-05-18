@@ -14,7 +14,8 @@
 
 use compiler::{Cacheable, Compiler, CompilerArguments, CompilerHasher, CompilerKind, Compilation,
                HashResult};
-use futures::{Future, future};
+use futures::future;
+use futures::prelude::*;
 use futures_cpupool::CpuPool;
 use log::LogLevel::Trace;
 use mock_command::{CommandCreatorSync, RunCommand};
@@ -133,16 +134,16 @@ fn arg_in(arg: &str, set: &HashSet<&str>) -> bool
 
 /// Calculate the SHA-1 digest of each file in `files` on background threads
 /// in `pool`.
-fn hash_all(files: Vec<String>, pool: &CpuPool) -> SFuture<Vec<String>>
+#[async]
+fn hash_all(files: Vec<String>, pool: CpuPool) -> Result<Vec<String>>
 {
     let start = Instant::now();
     let count = files.len();
-    let pool = pool.clone();
-    Box::new(future::join_all(files.into_iter().map(move |f| Digest::file(f, &pool)))
-             .map(move |hashes| {
-                 trace!("Hashed {} files in {}", count, fmt_duration_as_secs(&start.elapsed()));
-                 hashes
-             }))
+    let result = await!(future::join_all(files.into_iter().map(move |f| {
+        Digest::file(f, &pool)
+    })))?;
+    trace!("Hashed {} files in {}", count, fmt_duration_as_secs(&start.elapsed()));
+    Ok(result)
 }
 
 /// Calculate SHA-1 digests for all source files listed in rustc's dep-info output.
@@ -189,7 +190,7 @@ fn hash_source_files<T>(creator: &T,
                    files.len(), fmt_duration_as_secs(&start.elapsed()));
             // Just to make sure we capture temp_dir.
             drop(temp_dir);
-            hash_all(files, &pool)
+            hash_all(files, pool)
         }))
     }))
 }
@@ -283,7 +284,7 @@ impl Rust {
             Ok(libs)
         });
         Box::new(libs.and_then(move |libs| {
-            hash_all(libs, &pool).map(move |digests| {
+            hash_all(libs, pool).map(move |digests| {
                 Rust {
                     executable: executable,
                     compiler_shlibs_digests: digests,
@@ -503,10 +504,10 @@ impl<T> CompilerHasher<T> for RustHasher
     where T: CommandCreatorSync,
 {
     fn generate_hash_key(self: Box<Self>,
-                         creator: &T,
-                         cwd: &Path,
-                         env_vars: &[(OsString, OsString)],
-                         pool: &CpuPool)
+                         creator: T,
+                         cwd: PathBuf,
+                         env_vars: Vec<(OsString, OsString)>,
+                         pool: CpuPool)
                          -> SFuture<HashResult<T>>
     {
         let me = *self;
@@ -524,14 +525,20 @@ impl<T> CompilerHasher<T> for RustHasher
             .flat_map(|(arg, val)| Some(arg).into_iter().chain(val))
             .map(|a| a.clone())
             .collect::<Vec<_>>();
-        let source_hashes = hash_source_files(creator, &crate_name, &executable, &filtered_arguments, cwd, env_vars, pool);
+        let source_hashes = hash_source_files(&creator,
+                                              &crate_name,
+                                              &executable,
+                                              &filtered_arguments,
+                                              &cwd,
+                                              &env_vars,
+                                              &pool);
         // Hash the contents of the externs listed on the commandline.
-        let cwp = Path::new(cwd);
+        let cwp = Path::new(&cwd);
         trace!("[{}]: hashing {} externs", crate_name, externs.len());
         let extern_hashes = hash_all(externs.iter()
                                      .map(|e| cwp.join(e).to_string_lossy().into_owned())
                                      .collect(),
-                                     &pool);
+                                     pool.clone());
         let creator = creator.clone();
         let cwd = cwd.to_owned();
         let env_vars = env_vars.to_vec();

@@ -18,6 +18,7 @@ error-chain = { version = "0.7.2", default-features = false }
 fern = "0.3.5"
 filetime = "0.1"
 futures = "0.1.11"
+futures-await = { path = "../futures-await" }
 futures-cpupool = "0.1"
 hyper = { git = "https://github.com/hyperium/hyper", optional = true }
 hyper-tls = { git = "https://github.com/hyperium/hyper-tls", optional = true }
@@ -71,5 +72,10 @@ unstable = []
 
 [profile.release]
 debug = true
+
+[profile.dev]
+debug = false
+[profile.test]
+debug = false
 
 [workspace]

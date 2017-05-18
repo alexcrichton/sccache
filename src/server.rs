@@ -29,7 +29,7 @@ use filetime::FileTime;
 use futures::future;
 use futures::sync::mpsc;
 use futures::task::{self, Task};
-use futures::{Stream, Sink, Async, AsyncSink, Poll, StartSend, Future};
+use futures::prelude::*;
 use futures_cpupool::CpuPool;
 use mock_command::{
     CommandCreatorSync,
@@ -345,7 +345,7 @@ impl<C> Service for SccacheService<C>
             Request::Compile(compile) => {
                 debug!("handle_client: compile");
                 self.stats.borrow_mut().compile_requests += 1;
-                return self.handle_compile(compile)
+                return self.clone().handle_compile(compile)
             }
             Request::GetStats => {
                 debug!("handle_client: get_stats");
@@ -411,25 +411,23 @@ impl<C> SccacheService<C>
     /// This will handle a compile request entirely, generating a response with
     /// the inital information and an optional body which will eventually
     /// contain the results of the compilation.
-    fn handle_compile(&self, compile: Compile)
-                      -> SFuture<SccacheResponse>
-    {
+    #[async(boxed)]
+    fn handle_compile(self, compile: Compile) -> Result<SccacheResponse> {
         let exe = compile.exe;
         let cmd = compile.args;
         let cwd = compile.cwd;
         let env_vars = compile.env_vars;
-        let me = self.clone();
-        Box::new(self.compiler_info(exe.into()).map(move |info| {
-            me.check_compiler(info, cmd, cwd.into(), env_vars)
-        }))
+        let info = await!(self.clone().compiler_info(exe.into()))?;
+        Ok(self.check_compiler(info, cmd, cwd.into(), env_vars))
     }
 
     /// Look up compiler info from the cache for the compiler `path`.
     /// If not cached, determine the compiler type and cache the result.
-    fn compiler_info(&self, path: PathBuf)
-                     -> SFuture<Option<Box<Compiler<C>>>> {
+    #[async]
+    fn compiler_info(self, path: PathBuf) -> Result<Option<Box<Compiler<C>>>> {
         trace!("compiler_info");
-        let mtime = ftry!(metadata(&path).map(|attr| FileTime::from_last_modification_time(&attr)));
+        let attr = metadata(&path)?;
+        let mtime = FileTime::from_last_modification_time(&attr);
         //TODO: properly handle rustup overrides. Currently this will
         // cache based on the rustup rustc path, ignoring overrides.
         // https://github.com/mozilla/sccache/issues/87
@@ -443,21 +441,20 @@ impl<C> SccacheService<C>
         match result {
             Some(info) => {
                 trace!("compiler_info cache hit");
-                f_ok(info)
+                Ok(info)
             }
             None => {
                 trace!("compiler_info cache miss");
                 // Check the compiler type and return the result when
                 // finished. This generally involves invoking the compiler,
                 // so do it asynchronously.
-                let me = self.clone();
 
-                let info = get_compiler_info(&self.creator, &path, &self.pool);
-                Box::new(info.then(move |info| {
-                    let info = info.ok();
-                    me.compilers.borrow_mut().insert(path, info.clone().map(|i| (i, mtime)));
-                    Ok(info)
-                }))
+                let compilers = self.compilers;
+                let info = await!(get_compiler_info(self.creator,
+                                                    path.clone(),
+                                                    self.pool)).ok();
+                compilers.borrow_mut().insert(path, info.clone().map(|i| (i, mtime)));
+                Ok(info)
             }
         }
     }
@@ -485,7 +482,14 @@ impl<C> SccacheService<C>
                         debug!("parse_arguments: Ok");
                         stats.requests_executed += 1;
                         let (tx, rx) = Body::pair();
-                        self.start_compile_task(hasher, cmd, cwd, env_vars, tx);
+                        let task = self.clone().compile(hasher,
+                                                        cmd,
+                                                        cwd,
+                                                        env_vars,
+                                                        tx);
+                        self.handle.spawn(task.map_err(|e| {
+                            error!("error in spawned task: {}", e);
+                        }));
                         let res = CompileResponse::CompileStarted;
                         return Message::WithBody(Response::Compile(res), rx)
                     }
@@ -509,12 +513,13 @@ impl<C> SccacheService<C>
     /// Given compiler arguments `arguments`, look up
     /// a compile result in the cache or execute the compilation and store
     /// the result in the cache.
-    fn start_compile_task(&self,
-                          hasher: Box<CompilerHasher<C>>,
-                          arguments: Vec<OsString>,
-                          cwd: PathBuf,
-                          env_vars: Vec<(OsString, OsString)>,
-                          tx: mpsc::Sender<Result<Response>>) {
+    #[async]
+    fn compile(self,
+               hasher: Box<CompilerHasher<C>>,
+               arguments: Vec<OsString>,
+               cwd: PathBuf,
+               env_vars: Vec<(OsString, OsString)>,
+               tx: mpsc::Sender<Result<Response>>) -> Result<()> {
         let force_recache = env_vars.iter().any(|&(ref k, ref _v)| {
             k.as_os_str() == OsStr::new("SCCACHE_RECACHE")
         });
@@ -524,117 +529,113 @@ impl<C> SccacheService<C>
             CacheControl::Default
         };
         let out_pretty = hasher.output_pretty().into_owned();
-        let result = hasher.get_cached_or_compile(self.creator.clone(),
-                                                  self.storage.clone(),
-                                                  arguments,
-                                                  cwd,
-                                                  env_vars,
-                                                  cache_control,
-                                                  self.pool.clone(),
-                                                  self.handle.clone());
-        let me = self.clone();
-        let task = result.then(move |result| {
-            let mut cache_write = None;
-            let mut stats = me.stats.borrow_mut();
-            let mut res = CompileFinished::default();
-            match result {
-                Ok((compiled, out)) => {
-                    match compiled {
-                        CompileResult::Error => {
-                            stats.cache_errors += 1;
-                        }
-                        CompileResult::CacheHit(duration) => {
-                            stats.cache_hits += 1;
-                            stats.cache_read_hit_duration += duration;
-                        },
-                        CompileResult::CacheMiss(miss_type, duration, future) => {
-                            match miss_type {
-                                MissType::Normal => {}
-                                MissType::ForcedRecache => {
-                                    stats.forced_recaches += 1;
-                                }
-                                MissType::TimedOut => {
-                                    stats.cache_timeouts += 1;
-                                }
-                                MissType::CacheReadError => {
-                                    stats.cache_errors += 1;
-                                }
+        let result = await!(hasher.get_cached_or_compile(self.creator.clone(),
+                                                         self.storage.clone(),
+                                                         arguments,
+                                                         cwd,
+                                                         env_vars,
+                                                         cache_control,
+                                                         self.pool.clone(),
+                                                         self.handle.clone()));
+        let mut cache_write = None;
+        let mut res = CompileFinished::default();
+        match result {
+            Ok((compiled, out)) => {
+                let mut stats = self.stats.borrow_mut();
+                match compiled {
+                    CompileResult::Error => {
+                        stats.cache_errors += 1;
+                    }
+                    CompileResult::CacheHit(duration) => {
+                        stats.cache_hits += 1;
+                        stats.cache_read_hit_duration += duration;
+                    },
+                    CompileResult::CacheMiss(miss_type, duration, future) => {
+                        match miss_type {
+                            MissType::Normal => {}
+                            MissType::ForcedRecache => {
+                                stats.forced_recaches += 1;
                             }
-                            stats.cache_misses += 1;
-                            stats.cache_read_miss_duration += duration;
-                            cache_write = Some(future);
+                            MissType::TimedOut => {
+                                stats.cache_timeouts += 1;
+                            }
+                            MissType::CacheReadError => {
+                                stats.cache_errors += 1;
+                            }
                         }
-                        CompileResult::NotCacheable => {
-                            stats.cache_misses += 1;
-                            stats.non_cacheable_compilations += 1;
-                        }
-                        CompileResult::CompileFailed => {
-                            stats.compile_fails += 1;
-                        }
-                    };
-                    let Output { status, stdout, stderr } = out;
-                    trace!("CompileFinished retcode: {}", status);
-                    match status.code() {
-                        Some(code) => res.retcode = Some(code),
-                        None => res.signal = Some(get_signal(status)),
-                    };
-                    res.stdout = stdout;
-                    res.stderr = stderr;
-                }
-                Err(Error(ErrorKind::ProcessError(output), _)) => {
-                    debug!("Compilation failed: {:?}", output);
-                    stats.compile_fails += 1;
-                    match output.status.code() {
-                        Some(code) => res.retcode = Some(code),
-                        None => res.signal = Some(get_signal(output.status)),
-                    };
-                    res.stdout = output.stdout;
-                    res.stderr = output.stderr;
-                }
-                Err(err) => {
-                    use std::fmt::Write;
-
-                    error!("[{:?}] fatal error: {}", out_pretty, err);
-
-                    let mut error = format!("sccache: encountered fatal error\n");
-                    drop(writeln!(error, "sccache: error : {}", err));
-                    for e in err.iter() {
-                        error!("[{:?}] \t{}", out_pretty, e);
-                        drop(writeln!(error, "sccache:  cause: {}", e));
+                        stats.cache_misses += 1;
+                        stats.cache_read_miss_duration += duration;
+                        cache_write = Some(future);
                     }
-                    stats.cache_errors += 1;
-                    //TODO: figure out a better way to communicate this?
-                    res.retcode = Some(-2);
-                    res.stderr = error.into_bytes();
-                }
-            };
-            let send = tx.send(Ok(Response::CompileFinished(res)));
-
-            let me = me.clone();
-            let cache_write = cache_write.then(move |result| {
-                match result {
-                    Err(e) => {
-                        debug!("Error executing cache write: {}", e);
-                        me.stats.borrow_mut().cache_write_errors += 1;
+                    CompileResult::NotCacheable => {
+                        stats.cache_misses += 1;
+                        stats.non_cacheable_compilations += 1;
                     }
-                    //TODO: save cache stats!
-                    Ok(Some(info)) => {
-                        debug!("[{}]: Cache write finished in {}",
-                               info.object_file_pretty,
-                               fmt_duration_as_secs(&info.duration));
-                        me.stats.borrow_mut().cache_writes += 1;
-                        me.stats.borrow_mut().cache_write_duration += info.duration;
+                    CompileResult::CompileFailed => {
+                        stats.compile_fails += 1;
                     }
+                };
+                let Output { status, stdout, stderr } = out;
+                trace!("CompileFinished retcode: {}", status);
+                match status.code() {
+                    Some(code) => res.retcode = Some(code),
+                    None => res.signal = Some(get_signal(status)),
+                };
+                res.stdout = stdout;
+                res.stderr = stderr;
+            }
+            Err(Error(ErrorKind::ProcessError(output), _)) => {
+                let mut stats = self.stats.borrow_mut();
+                debug!("Compilation failed: {:?}", output);
+                stats.compile_fails += 1;
+                match output.status.code() {
+                    Some(code) => res.retcode = Some(code),
+                    None => res.signal = Some(get_signal(output.status)),
+                };
+                res.stdout = output.stdout;
+                res.stderr = output.stderr;
+            }
+            Err(err) => {
+                use std::fmt::Write;
 
-                    Ok(None) => {}
+                error!("[{:?}] fatal error: {}", out_pretty, err);
+
+                let mut error = format!("sccache: encountered fatal error\n");
+                drop(writeln!(error, "sccache: error : {}", err));
+                for e in err.iter() {
+                    error!("[{:?}] \t{}", out_pretty, e);
+                    drop(writeln!(error, "sccache:  cause: {}", e));
                 }
-                Ok(())
-            });
+                self.stats.borrow_mut().cache_errors += 1;
+                //TODO: figure out a better way to communicate this?
+                res.retcode = Some(-2);
+                res.stderr = error.into_bytes();
+            }
+        };
+        let send = tx.send(Ok(Response::CompileFinished(res)));
 
-            send.join(cache_write).then(|_| Ok(()))
+        let cache_write = cache_write.then(move |result| {
+            match result {
+                Err(e) => {
+                    debug!("Error executing cache write: {}", e);
+                    self.stats.borrow_mut().cache_write_errors += 1;
+                }
+                //TODO: save cache stats!
+                Ok(Some(info)) => {
+                    debug!("[{}]: Cache write finished in {}",
+                           info.object_file_pretty,
+                           fmt_duration_as_secs(&info.duration));
+                    self.stats.borrow_mut().cache_writes += 1;
+                    self.stats.borrow_mut().cache_write_duration += info.duration;
+                }
+
+                Ok(None) => {}
+            }
+            Ok(())
         });
 
-        self.handle.spawn(task);
+        drop(await!(send.join(cache_write)));
+        Ok(())
     }
 }
 

@@ -264,7 +264,7 @@ pub fn preprocess<T>(creator: &T,
     if log_enabled!(Trace) {
         trace!("preprocess: {:?}", cmd);
     }
-    run_input_output(cmd, None)
+    Box::new(run_input_output(cmd, None))
 }
 
 fn compile<T>(creator: &T,
